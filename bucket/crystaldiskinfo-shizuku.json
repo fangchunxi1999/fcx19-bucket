@@ -43,7 +43,7 @@
     ],
     "checkver": {
         "url": "https://osdn.net/projects/crystaldiskinfo/",
-        "regex": "<a href=\"/projects/crystaldiskinfo/releases/(?<release>[\\d]*)\">CrystalDiskInfo ([\\d+\\.*]+)</a>"
+        "regex": "releases/(?<release>[\\d]+)\">CrystalDiskInfo ([\\w.]+)<"
     },
     "autoupdate": {
         "url": "https://free.nchc.org.tw/osdn//crystaldiskinfo/$matchRelease/CrystalDiskInfo$underscoreVersionShizuku.zip",
