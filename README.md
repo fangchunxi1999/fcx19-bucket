@@ -1,7 +1,7 @@
 # Scoop Bucket for FCX19
 
-[![Tests](https://github.com/fangchunxi1999/fcx19-bucket/actions/workflows/ci.yml/badge.svg)](https://github.com/fangchunxi1999/fcx19-bucket/actions/workflows/ci.yml)
-[![Excavator](https://github.com/fangchunxi1999/fcx19-bucket/actions/workflows/excavator.yml/badge.svg)](https://github.com/fangchunxi1999/fcx19-bucket/actions/workflows/excavator.yml)
+[![Tests](https://github.com/fangchunxi1999/fcx19-bucket/workflows/Tests/badge.svg)](https://github.com/fangchunxi1999/fcx19-bucket/actions/workflows/ci.yml)
+[![Excavator](https://github.com/fangchunxi1999/fcx19-bucket/workflows/Excavator/badge.svg)](https://github.com/fangchunxi1999/fcx19-bucket/actions/workflows/excavator.yml)
 
 How do I install these manifests?
 ---------------------------------
