@@ -12,13 +12,13 @@
             "bin": [
                 [
                     "DiskInfo64K.exe",
-                    "DiskInfo"
+                    "DiskInfo-KureiKei"
                 ]
             ],
             "shortcuts": [
                 [
                     "DiskInfo64K.exe",
-                    "CrystalDiskInfo"
+                    "CrystalDiskInfo (Kurei Kei Edition)"
                 ]
             ]
         },
@@ -26,13 +26,13 @@
             "bin": [
                 [
                     "DiskInfo32K.exe",
-                    "DiskInfo"
+                    "DiskInfo-KureiKei"
                 ]
             ],
             "shortcuts": [
                 [
                     "DiskInfo32K",
-                    "CrystalDiskInfo"
+                    "CrystalDiskInfo (Kurei Kei Edition)"
                 ]
             ]
         }

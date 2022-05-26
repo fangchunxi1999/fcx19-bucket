@@ -12,13 +12,13 @@
             "bin": [
                 [
                     "DiskInfo64S.exe",
-                    "DiskInfo"
+                    "DiskInfo-Shizuku"
                 ]
             ],
             "shortcuts": [
                 [
                     "DiskInfo64S.exe",
-                    "CrystalDiskInfo"
+                    "CrystalDiskInfo (Shizuku Edition)"
                 ]
             ]
         },
@@ -26,13 +26,13 @@
             "bin": [
                 [
                     "DiskInfo32S.exe",
-                    "DiskInfo"
+                    "DiskInfo-Shizuku"
                 ]
             ],
             "shortcuts": [
                 [
                     "DiskInfo32S",
-                    "CrystalDiskInfo"
+                    "CrystalDiskInfo (Shizuku Edition)"
                 ]
             ]
         }

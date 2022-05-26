@@ -16,13 +16,13 @@
             "bin": [
                 [
                     "DiskMark64S.exe",
-                    "DiskMark"
+                    "DiskMark-Shizuku"
                 ]
             ],
             "shortcuts": [
                 [
                     "DiskMark64S.exe",
-                    "CrystalDiskMark"
+                    "CrystalDiskMark (Shizuku Edition)"
                 ]
             ]
         },
@@ -30,13 +30,13 @@
             "bin": [
                 [
                     "DiskMark32S.exe",
-                    "DiskMark"
+                    "DiskMark-Shizuku"
                 ]
             ],
             "shortcuts": [
                 [
                     "DiskMark32S.exe",
-                    "CrystalDiskMark"
+                    "CrystalDiskMark (Shizuku Edition)"
                 ]
             ]
         }
