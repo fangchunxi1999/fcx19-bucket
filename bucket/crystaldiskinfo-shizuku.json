@@ -1,11 +1,11 @@
 {
     "$schema": "https://raw.githubusercontent.com/ScoopInstaller/Scoop/master/schema.json",
-    "version": "8.17.13",
+    "version": "8.17.14",
     "description": "A HDD/SSD utility software which supports a part of USB, Intel RAID and NVMe.",
     "homepage": "https://crystalmark.info/en/software/crystaldiskinfo/",
     "license": "MIT",
-    "url": "https://free.nchc.org.tw/osdn//crystaldiskinfo/78047/CrystalDiskInfo8_17_13Shizuku.zip",
-    "hash": "fc7e545f88c65f67f0df8e62cae312cb58fa589c66924e516cbacf59382adfb6",
+    "url": "https://free.nchc.org.tw/osdn//crystaldiskinfo/78192/CrystalDiskInfo8_17_14Shizuku.zip",
+    "hash": "233208d67d9592f1778bf13d25e84756887d1376a205359810ba792f7e62f390",
     "pre_install": "if (!(Test-Path \"$persist_dir\\DiskInfo.ini\")) { New-Item \"$dir\\DiskInfo.ini\" | Out-Null }",
     "architecture": {
         "64bit": {
