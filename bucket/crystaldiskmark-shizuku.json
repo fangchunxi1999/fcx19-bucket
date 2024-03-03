@@ -1,11 +1,11 @@
 {
     "$schema": "https://raw.githubusercontent.com/ScoopInstaller/Scoop/master/schema.json",
-    "version": "8.0.4c",
-    "description": "CrystalDiskMark is a simple disk benchmark software.",
+    "version": "8.0.5",
+    "description": "A simple disk benchmark software",
     "homepage": "https://crystalmark.info/en/software/crystaldiskmark/",
     "license": "BSD-3-Clause",
-    "url": "https://crystalmark.info/download/zz/CrystalDiskMark8_0_4cShizuku.zip",
-    "hash": "6adc29892115612160db4075ef673804dc44f2cff37681590814734afcd05989",
+    "url": "https://sourceforge.net/projects/crystaldiskmark/files/8.0.5/CrystalDiskMark8_0_5Shizuku.zip",
+    "hash": "sha1:a9bfcfaa2602bd1ae8679636fa949cf791c4c2fb",
     "pre_install": [
         "'64', '32' | ForEach-Object {",
         "    if (!(Test-Path \"$persist_dir\\DiskMark$_.ini\")) { New-Item \"$dir\\DiskMark$_.ini\" | Out-Null }",
@@ -46,10 +46,10 @@
         "DiskMark64.ini"
     ],
     "checkver": {
-        "url": "https://crystalmark.info/en/download/",
-        "regex": "CrystalDiskMark\\s+([\\w.]+)\\s"
+        "sourceforge": "crystaldiskmark",
+        "regex": "([\\d.a-zA-Z]+)/CrystalDiskMark.*.zip"
     },
     "autoupdate": {
-        "url": "https://crystalmark.info/download/zz/CrystalDiskMark$underscoreVersionShizuku.zip"
+        "url": "https://sourceforge.net/projects/crystaldiskmark/files/$version/CrystalDiskMark$underscoreVersionShizuku.zip"
     }
 }
