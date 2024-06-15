@@ -1,11 +1,11 @@
 {
     "$schema": "https://raw.githubusercontent.com/ScoopInstaller/Scoop/master/schema.json",
-    "version": "9.3.0",
+    "version": "9.3.1",
     "description": "A HDD/SSD utility software which supports a part of USB, RAID and NVMe",
     "homepage": "https://crystalmark.info/en/software/crystaldiskinfo/",
     "license": "MIT",
-    "url": "https://sourceforge.net/projects/crystaldiskinfo/files/9.3.0/CrystalDiskInfo9_3_0Shizuku.zip",
-    "hash": "sha1:e76e241970510b5174a622ce92c9f999faf07b2d",
+    "url": "https://sourceforge.net/projects/crystaldiskinfo/files/9.3.1/CrystalDiskInfo9_3_1Shizuku.zip",
+    "hash": "sha1:8c523bdb684f875375695069ca751c4a75a30e2c",
     "pre_install": [
         "if (!(Test-Path \"$persist_dir\\DiskInfo.ini\")) { New-Item \"$dir\\DiskInfo.ini\" | Out-Null }",
         "# Manually persist AMD RAID plugins (AMD_RC2t7x64.dll, AMD_RC2t7x86.dll)",
