@@ -5,7 +5,7 @@
     "homepage": "https://crystalmark.info/en/software/crystaldiskinfo/",
     "license": "MIT",
     "url": "https://sourceforge.net/projects/crystaldiskinfo/files/9.3.1/CrystalDiskInfo9_3_1Aoi.zip",
-    "hash": "sha1:48b35f5019bfed125161090c45e6b338decb9aa1",
+    "hash": "sha1:685b5c25931d13bab41cc9895b202f2602bfcd84",
     "pre_install": [
         "if (!(Test-Path \"$persist_dir\\DiskInfo.ini\")) { New-Item \"$dir\\DiskInfo.ini\" | Out-Null }",
         "# Manually persist AMD RAID plugins (AMD_RC2t7x64.dll, AMD_RC2t7x86.dll)",
