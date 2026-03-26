@@ -8,8 +8,7 @@ on:
   pull_request_review_comment:
     types: [created, edited, deleted]
   push:
-    branches:
-      - "**"
+    branches: ["**"]
 
 jobs:
   notify:
