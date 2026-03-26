@@ -48,7 +48,7 @@ jobs:
             git fetch origin ${{ env.THREAD_STORE_BRANCH }}
             git worktree add ${{ env.THREAD_STORE_DIR }} ${{ env.THREAD_STORE_BRANCH }}
           else
-            git worktree add --orphan ${{ env.THREAD_STORE_DIR }} ${{ env.THREAD_STORE_BRANCH }}
+            git worktree add --orphan ${{ env.THREAD_STORE_DIR }} -b ${{ env.THREAD_STORE_BRANCH }}
             cd ${{ env.THREAD_STORE_DIR }} && git commit --allow-empty -m "Initialize discord-threads storage branch"
             git push origin ${{ env.THREAD_STORE_BRANCH }}
           fi
