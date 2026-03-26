@@ -319,6 +319,9 @@ jobs:
           PR_NUMBER: ${{ steps.pr_info.outputs.pr_number }}
         run: |
           cd ${{ env.THREAD_STORE_DIR }}
+          # The main checkout uses sparse-checkout (.github/workflows only), which the worktree
+          # inherits. Disable it here so git add can stage files in .github/discord-threads/.
+          git sparse-checkout disable
           git config user.email "${{ env.GIT_USER_EMAIL }}"
           git config user.name "${{ env.GIT_USER_NAME }}"
           git add ".github/discord-threads/pr-${PR_NUMBER}.txt"
