@@ -239,8 +239,8 @@ jobs:
             "closed")
               # Distinguish between a merge and a plain close
               if [ "$PR_MERGED" = "true" ]; then
-                MESSAGE="✅ **PR Merged** by ${ACTOR}"
-                COLOR=65280
+                MESSAGE="🟣 **PR Merged** by ${ACTOR}"
+                COLOR=9000933
               else
                 MESSAGE="❌ **PR Closed** by ${ACTOR}"
                 COLOR=16711680
@@ -251,7 +251,8 @@ jobs:
               COLOR=16776960
               ;;
             "submitted")
-              # Full review submitted — differentiate approve / request-changes / comment
+              # Full review submitted — approve and changes_requested carry distinct meaning;
+              # a plain comment-type review is shown the same as an inline comment ("New Review")
               case "$REVIEW_STATE" in
                 "approved")
                   MESSAGE="✅ **Review Approved** by ${REVIEW_USER}"
@@ -262,23 +263,23 @@ jobs:
                   COLOR=16776960
                   ;;
                 *)
-                  MESSAGE="💬 **Review Submitted** by ${REVIEW_USER}"
-                  COLOR=3066993
+                  MESSAGE="📝 **New Review** by ${REVIEW_USER}"
+                  COLOR=3447003
                   ;;
               esac
               ;;
             "created")
-              # Differentiate an inline diff comment from a PR conversation comment
+              # inline diff comment (pull_request_review_comment) or PR conversation comment (issue_comment)
               if [ "$EVENT_NAME" == "pull_request_review_comment" ]; then
-                MESSAGE="📝 **Inline Comment** by ${COMMENT_USER}"$'\n'"On \`${COMMENT_PATH}\`"
+                MESSAGE="📝 **New Review** by ${COMMENT_USER}"$'\n'"On \`${COMMENT_PATH}\`"
               else
                 MESSAGE="💬 **New Comment** by ${COMMENT_USER}"
               fi
-              COLOR=3066993
+              COLOR=3447003
               ;;
             *)
               MESSAGE="🔔 **PR Activity** by ${ACTOR}"
-              COLOR=3066993
+              COLOR=3447003
               ;;
           esac
 
