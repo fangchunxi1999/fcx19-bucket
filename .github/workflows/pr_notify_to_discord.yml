@@ -46,8 +46,12 @@ jobs:
     steps:
       # Checks out the PR merge commit. The checkout action also writes git credentials
       # into the local git config so later `git push` calls work without a token in the URL.
+      # sparse-checkout limits the download to the workflows directory; none of the repo
+      # files (bucket/, bin/, etc.) are needed by this notification workflow.
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/workflows
 
       # Mount the ${{ env.THREAD_STORE_BRANCH }} branch as a git worktree at ${{ env.THREAD_STORE_DIR }}.
       # This branch is the sole storage location for Discord thread IDs — it never touches master or feature branches.
@@ -58,8 +62,9 @@ jobs:
           git config --global user.email "${{ env.GIT_USER_EMAIL }}"
           git config --global user.name "${{ env.GIT_USER_NAME }}"
 
-          if git ls-remote --exit-code --heads origin ${{ env.THREAD_STORE_BRANCH }}; then
-            git fetch origin ${{ env.THREAD_STORE_BRANCH }}
+          # A single `git fetch --depth=1` both probes for the branch and retrieves it,
+          # replacing the previous two-call ls-remote + fetch pattern.
+          if git fetch --depth=1 origin ${{ env.THREAD_STORE_BRANCH }} 2>/dev/null; then
             git worktree add ${{ env.THREAD_STORE_DIR }} ${{ env.THREAD_STORE_BRANCH }}
           else
             git worktree add --orphan ${{ env.THREAD_STORE_DIR }} -b ${{ env.THREAD_STORE_BRANCH }}
