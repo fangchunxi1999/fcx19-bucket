@@ -154,11 +154,10 @@ jobs:
             '{
               embeds: [{
                 title: "📬 New Pull Request",
-                description: "**\($title)**\n\n👤 **Author:** \($author)\n🌿 **Branch:** `\($head)` → `\($base)`",
+                description: "**\($title)**\n\n👤 **Author:** \($author)\n🌿 **Branch:** `\($head)` → `\($base)`\n\n[\($footer)](\($url))",
                 url: $url,
                 color: 3066993,
-                timestamp: $timestamp,
-                footer: { text: $footer }
+                timestamp: $timestamp
               }]
             }')
 
@@ -293,11 +292,10 @@ jobs:
             --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)" \
             '{
               embeds: [{
-                description: $description,
+                description: "\($description)\n\n[\($footer)](\($url))",
                 url: $url,
                 color: $color,
-                timestamp: $timestamp,
-                footer: { text: $footer }
+                timestamp: $timestamp
               }]
             }')
 
