@@ -44,6 +44,9 @@ jobs:
       # Git credentials from the checkout above are inherited automatically.
       - name: Setup discord-threads store
         run: |
+          git config --global user.email "${{ env.GIT_USER_EMAIL }}"
+          git config --global user.name "${{ env.GIT_USER_NAME }}"
+
           if git ls-remote --exit-code --heads origin ${{ env.THREAD_STORE_BRANCH }}; then
             git fetch origin ${{ env.THREAD_STORE_BRANCH }}
             git worktree add ${{ env.THREAD_STORE_DIR }} ${{ env.THREAD_STORE_BRANCH }}
