@@ -15,3 +15,4 @@ jobs:
         with:
           discord_webhook_url: ${{ secrets.DISCORD_WEBHOOK }}
           discord_id_map_json: ${{ secrets.DISCORD_ID_MAP_JSON }}
+
