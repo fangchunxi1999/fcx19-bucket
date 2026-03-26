@@ -108,8 +108,9 @@ jobs:
           fi
 
       - name: Send New PR Notification
-        # Also fires on 'reopened' when the stored thread is gone, so a fresh embed+thread is created.
-        if: (github.event.action == 'opened' || github.event.action == 'reopened') && (steps.check_thread.outputs.has_thread == 'false' || steps.verify_thread.outputs.thread_alive == 'false')
+        # Runs whenever no thread exists yet, regardless of event action.
+        # This ensures a thread is always created before any update is posted.
+        if: steps.check_thread.outputs.has_thread == 'false' || steps.verify_thread.outputs.thread_alive == 'false'
         id: new_pr
         env:
           PR_TITLE: ${{ steps.pr_info.outputs.pr_title }}
@@ -150,7 +151,7 @@ jobs:
           echo "message_id=$MESSAGE_ID" >> $GITHUB_OUTPUT
 
       - name: Create Thread for New PR
-        if: (github.event.action == 'opened' || github.event.action == 'reopened') && steps.new_pr.outputs.message_id != ''
+        if: steps.new_pr.outputs.message_id != ''
         id: create_thread
         env:
           PR_NUMBER: ${{ steps.pr_info.outputs.pr_number }}
@@ -275,7 +276,7 @@ jobs:
             "$DISCORD_WEBHOOK?thread_id=$THREAD_ID"
 
       - name: Save Thread ID to discord-threads branch
-        if: (github.event.action == 'opened' || github.event.action == 'reopened') && steps.create_thread.outputs.thread_id != ''
+        if: steps.create_thread.outputs.thread_id != ''
         env:
           PR_NUMBER: ${{ steps.pr_info.outputs.pr_number }}
         run: |
