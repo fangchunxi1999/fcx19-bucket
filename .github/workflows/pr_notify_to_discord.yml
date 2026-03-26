@@ -1,0 +1,11 @@
+name: PR Notification
+on: [pull_request]
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify Discord
+        uses: nitecon/discord-action@v2
+        with:
+          webhook-url: ${{ secrets.DISCORD_WEBHOOK }}
