@@ -1,23 +1,11 @@
-name: Discord PR Notifications
-
-on:
-  pull_request:
-    types: [opened, closed, reopened, ready_for_review, converted_to_draft]
-  pull_request_review:
-    types: [submitted, edited, dismissed]
-  pull_request_review_comment:
-    types: [created, edited, deleted]
-  push:
-    branches:
-      - "**"
+name: Notify Discord
+on: [push, pull_request, release]
 
 jobs:
   notify:
     runs-on: ubuntu-latest
     steps:
       - name: Send Discord notification
-        uses: Yasser5711/Discord-PR-Notify@v1
+        uses: nitecon/discord-action@v2
         with:
-          discord_webhook_url: ${{ secrets.DISCORD_WEBHOOK }}
-          discord_id_map_json: "{}"
-          enable_mentions: "false"
+          webhook-url: ${{ secrets.DISCORD_WEBHOOK }}
