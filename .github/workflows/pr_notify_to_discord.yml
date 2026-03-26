@@ -228,7 +228,7 @@ jobs:
           THREAD_ID="${{ steps.create_thread.outputs.thread_id || steps.check_thread.outputs.thread_id }}"
 
           # Select message text and embed colour based on the event action.
-          # All user-controlled values come from env vars set above, never from ${{ }} inside the shell,
+          # All user-controlled values come from env vars set above, never interpolated inline,
           # which prevents script injection.
           case "$EVENT_ACTION" in
             "synchronize")
