@@ -1,17 +1,287 @@
 name: Discord PR Notifications
 
 on:
+  # Fires when a PR is opened, a new commit is pushed to it, it is closed/merged, or reopened
   pull_request:
-    types: [opened, closed, reopened, ready_for_review, converted_to_draft]
+    types: [opened, synchronize, closed, reopened]
+  # Fires when a reviewer submits a full review (approve / request changes / comment)
   pull_request_review:
     types: [submitted]
+  # Fires when someone leaves an inline comment on a specific line/file in the diff
+  pull_request_review_comment:
+    types: [created]
+  # Fires when someone posts a comment in the PR conversation thread (not on a file)
+  issue_comment:
+    types: [created]
 
 jobs:
-  notify:
+  notify-discord:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    # Serialize runs per PR so concurrent events don't race to push to the thread-store branch.
+    concurrency:
+      group: discord-thread-pr-${{ github.event.pull_request.number || github.event.issue.number }}
+      cancel-in-progress: false
+    if: github.event.pull_request != null || (github.event.issue.pull_request != null && github.event_name == 'issue_comment')
+    env:
+      THREAD_STORE_BRANCH: meta/discord-threads
+      THREAD_STORE_DIR: thread-store
+      THREAD_DATA_DIR: thread-store/.github/discord-threads
+      DISCORD_API_BASE: https://discord.com/api/v10
+      THREAD_ARCHIVE_DURATION: 1440
+      GIT_USER_EMAIL: action@github.com
+      GIT_USER_NAME: GitHub Action
+
     steps:
-      - name: Send Discord notification
-        uses: Yasser5711/Discord-PR-Notify@v1
-        with:
-          discord_webhook_url: ${{ secrets.DISCORD_WEBHOOK }}
-          discord_id_map_json: "{}"
+      # Checkout the main repo — this also configures git credentials on the runner
+      # so subsequent git commands can push without referencing GITHUB_TOKEN directly.
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Mount the ${{ env.THREAD_STORE_BRANCH }} branch as a git worktree at '${{ env.THREAD_STORE_DIR }}'.
+      # If the branch does not yet exist on the remote it is created as an orphan.
+      # Git credentials from the checkout above are inherited automatically.
+      - name: Setup discord-threads store
+        run: |
+          if git ls-remote --exit-code --heads origin ${{ env.THREAD_STORE_BRANCH }}; then
+            git fetch origin ${{ env.THREAD_STORE_BRANCH }}
+            git worktree add ${{ env.THREAD_STORE_DIR }} ${{ env.THREAD_STORE_BRANCH }}
+          else
+            git worktree add --orphan ${{ env.THREAD_STORE_DIR }} ${{ env.THREAD_STORE_BRANCH }}
+            cd ${{ env.THREAD_STORE_DIR }} && git commit --allow-empty -m "Initialize discord-threads storage branch"
+            git push origin ${{ env.THREAD_STORE_BRANCH }}
+          fi
+
+      - name: Get PR Info
+        id: pr_info
+        # Pass user-controlled values through env: to prevent script injection.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_URL: ${{ github.event.issue.html_url }}
+          GH_PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_PR_TITLE: ${{ github.event.pull_request.title }}
+          GH_PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          # issue_comment events expose the PR through github.event.issue rather
+          # than github.event.pull_request, so we branch on the event name here.
+          if [ "$EVENT_NAME" == "issue_comment" ]; then
+            echo "pr_number=$ISSUE_NUMBER" >> $GITHUB_OUTPUT
+            echo "pr_title=$ISSUE_TITLE" >> $GITHUB_OUTPUT
+            echo "pr_url=$ISSUE_URL" >> $GITHUB_OUTPUT
+          else
+            echo "pr_number=$GH_PR_NUMBER" >> $GITHUB_OUTPUT
+            echo "pr_title=$GH_PR_TITLE" >> $GITHUB_OUTPUT
+            echo "pr_url=$GH_PR_URL" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check for existing thread
+        id: check_thread
+        run: |
+          # Look for a previously stored thread ID file on the discord-threads branch
+          THREAD_ID_FILE="${{ env.THREAD_DATA_DIR }}/pr-${{ steps.pr_info.outputs.pr_number }}.txt"
+          if [ -f "$THREAD_ID_FILE" ]; then
+            THREAD_ID=$(cat "$THREAD_ID_FILE")
+            echo "thread_id=$THREAD_ID" >> $GITHUB_OUTPUT
+            echo "has_thread=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_thread=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Verify thread exists on Discord
+        id: verify_thread
+        if: steps.check_thread.outputs.has_thread == 'true'
+        run: |
+          THREAD_ID="${{ steps.check_thread.outputs.thread_id }}"
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bot ${{ secrets.DISCORD_BOT_TOKEN }}" \
+            "${{ env.DISCORD_API_BASE }}/channels/$THREAD_ID")
+          if [ "$HTTP_STATUS" = "200" ]; then
+            echo "thread_alive=true" >> $GITHUB_OUTPUT
+          else
+            echo "thread_alive=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Send New PR Notification
+        # Also fires on 'reopened' when the stored thread is gone, so a fresh embed+thread is created.
+        if: (github.event.action == 'opened' || github.event.action == 'reopened') && (steps.check_thread.outputs.has_thread == 'false' || steps.verify_thread.outputs.thread_alive == 'false')
+        id: new_pr
+        env:
+          PR_TITLE: ${{ steps.pr_info.outputs.pr_title }}
+          PR_URL: ${{ steps.pr_info.outputs.pr_url }}
+          PR_NUMBER: ${{ steps.pr_info.outputs.pr_number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          # Build JSON payload with jq to safely handle any characters in user-controlled fields.
+          PAYLOAD=$(jq -n \
+            --arg title "$PR_TITLE" \
+            --arg author "$PR_AUTHOR" \
+            --arg head "$PR_HEAD_REF" \
+            --arg base "$PR_BASE_REF" \
+            --arg url "$PR_URL" \
+            --arg footer "${{ github.repository }} · PR #${PR_NUMBER}" \
+            --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)" \
+            '{
+              embeds: [{
+                title: "📬 New Pull Request",
+                description: "**\($title)**\n\n👤 **Author:** \($author)\n🌿 **Branch:** `\($head)` → `\($base)`",
+                url: $url,
+                color: 3066993,
+                timestamp: $timestamp,
+                footer: { text: $footer }
+              }]
+            }')
+
+          RESPONSE=$(curl -s --fail-with-body \
+            -H "Content-Type: application/json" \
+            -X POST \
+            -d "$PAYLOAD" \
+            "$DISCORD_WEBHOOK?wait=true")
+
+          MESSAGE_ID=$(echo "$RESPONSE" | jq -r '.id')
+          echo "message_id=$MESSAGE_ID" >> $GITHUB_OUTPUT
+
+      - name: Create Thread for New PR
+        if: (github.event.action == 'opened' || github.event.action == 'reopened') && steps.new_pr.outputs.message_id != ''
+        id: create_thread
+        env:
+          PR_NUMBER: ${{ steps.pr_info.outputs.pr_number }}
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          # Fetch the channel ID from the webhook metadata endpoint
+          CHANNEL_ID=$(curl -s "$DISCORD_WEBHOOK" | jq -r '.channel_id')
+
+          # Create a Discord thread attached to the notification message
+          THREAD_PAYLOAD=$(jq -n \
+            --arg name "[${{ github.repository }}] PR #${PR_NUMBER} Discussion" \
+            --argjson duration ${{ env.THREAD_ARCHIVE_DURATION }} \
+            '{ name: $name, auto_archive_duration: $duration }')
+
+          THREAD_RESPONSE=$(curl -s --fail-with-body \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
+            -X POST \
+            -d "$THREAD_PAYLOAD" \
+            "${{ env.DISCORD_API_BASE }}/channels/$CHANNEL_ID/messages/${{ steps.new_pr.outputs.message_id }}/threads")
+
+          THREAD_ID=$(echo "$THREAD_RESPONSE" | jq -r '.id')
+
+          # Persist the thread ID to the discord-threads branch for future events on this PR
+          mkdir -p ${{ env.THREAD_DATA_DIR }}
+          echo "$THREAD_ID" > "${{ env.THREAD_DATA_DIR }}/pr-${PR_NUMBER}.txt"
+          echo "thread_id=$THREAD_ID" >> $GITHUB_OUTPUT
+
+      - name: Send Update to Thread
+        if: github.event.action != 'opened' && (steps.verify_thread.outputs.thread_alive == 'true' || steps.create_thread.outputs.thread_id != '')
+        env:
+          ACTOR: ${{ github.actor }}
+          REVIEW_USER: ${{ github.event.review.user.login }}
+          REVIEW_STATE: ${{ github.event.review.state }}
+          COMMENT_USER: ${{ github.event.comment.user.login }}
+          COMMENT_PATH: ${{ github.event.comment.path }}
+          PR_MERGED: ${{ github.event.pull_request.merged }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
+          PR_URL: ${{ steps.pr_info.outputs.pr_url }}
+          PR_NUMBER: ${{ steps.pr_info.outputs.pr_number }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          # Prefer a freshly created thread ID over the stored one (handles stale file case)
+          THREAD_ID="${{ steps.create_thread.outputs.thread_id || steps.check_thread.outputs.thread_id }}"
+
+          # Build the notification message and embed colour based on the event action.
+          # All user-controlled values are referenced via env vars to prevent injection.
+          case "$EVENT_ACTION" in
+            "synchronize")
+              # New commits were pushed to the PR branch
+              MESSAGE="🔄 **PR Updated** by ${ACTOR}\nNew commits pushed to the PR"
+              COLOR=16776960
+              ;;
+            "closed")
+              # Distinguish between a merge and a plain close
+              if [ "$PR_MERGED" = "true" ]; then
+                MESSAGE="✅ **PR Merged** by ${ACTOR}"
+                COLOR=65280
+              else
+                MESSAGE="❌ **PR Closed** by ${ACTOR}"
+                COLOR=16711680
+              fi
+              ;;
+            "reopened")
+              MESSAGE="🔓 **PR Reopened** by ${ACTOR}"
+              COLOR=16776960
+              ;;
+            "submitted")
+              # Full review submitted — differentiate approve / request-changes / comment
+              case "$REVIEW_STATE" in
+                "approved")
+                  MESSAGE="✅ **Review Approved** by ${REVIEW_USER}"
+                  COLOR=65280
+                  ;;
+                "changes_requested")
+                  MESSAGE="🔧 **Changes Requested** by ${REVIEW_USER}"
+                  COLOR=16776960
+                  ;;
+                *)
+                  MESSAGE="💬 **Review Submitted** by ${REVIEW_USER}"
+                  COLOR=3066993
+                  ;;
+              esac
+              ;;
+            "created")
+              # Differentiate an inline diff comment from a PR conversation comment
+              if [ "$EVENT_NAME" == "pull_request_review_comment" ]; then
+                MESSAGE="📝 **Inline Comment** by ${COMMENT_USER}\nOn \`${COMMENT_PATH}\`"
+              else
+                MESSAGE="💬 **New Comment** by ${COMMENT_USER}"
+              fi
+              COLOR=3066993
+              ;;
+            *)
+              MESSAGE="🔔 **PR Activity** by ${ACTOR}"
+              COLOR=3066993
+              ;;
+          esac
+
+          PAYLOAD=$(jq -n \
+            --arg description "$MESSAGE" \
+            --arg url "$PR_URL" \
+            --argjson color "$COLOR" \
+            --arg footer "${{ github.repository }} · PR #${PR_NUMBER}" \
+            --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)" \
+            '{
+              embeds: [{
+                description: $description,
+                url: $url,
+                color: $color,
+                timestamp: $timestamp,
+                footer: { text: $footer }
+              }]
+            }')
+
+          curl -s --fail-with-body \
+            -H "Content-Type: application/json" \
+            -X POST \
+            -d "$PAYLOAD" \
+            "$DISCORD_WEBHOOK?thread_id=$THREAD_ID"
+
+      - name: Save Thread ID to discord-threads branch
+        if: (github.event.action == 'opened' || github.event.action == 'reopened') && steps.create_thread.outputs.thread_id != ''
+        env:
+          PR_NUMBER: ${{ steps.pr_info.outputs.pr_number }}
+        run: |
+          # Commit the new thread ID file to the dedicated discord-threads branch
+          # so subsequent events on this PR can look it up without touching any
+          # regular code branch.
+          cd ${{ env.THREAD_STORE_DIR }}
+          git config user.email "${{ env.GIT_USER_EMAIL }}"
+          git config user.name "${{ env.GIT_USER_NAME }}"
+          git add ".github/discord-threads/pr-${PR_NUMBER}.txt"
+          git commit -m "Add Discord thread ID for PR #${PR_NUMBER}" || exit 0
+          git push origin ${{ env.THREAD_STORE_BRANCH }}
