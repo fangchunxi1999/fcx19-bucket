@@ -1,4 +1,4 @@
-name: Discord PR Notifications
+name: Discord PR Notifications!
 
 on:
   pull_request:
