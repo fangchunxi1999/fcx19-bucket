@@ -4,11 +4,7 @@ on:
   pull_request:
     types: [opened, closed, reopened, ready_for_review, converted_to_draft]
   pull_request_review:
-    types: [submitted, edited, dismissed]
-  pull_request_review_comment:
-    types: [created, edited, deleted]
-  push:
-    branches: ["**"]
+    types: [submitted]
 
 jobs:
   notify:
