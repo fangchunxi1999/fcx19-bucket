@@ -1,4 +1,4 @@
-name: Discord PR Notifications!
+name: Discord PR Notifications
 
 on:
   pull_request:
@@ -14,4 +14,5 @@ jobs:
         uses: Yasser5711/Discord-PR-Notify@v1
         with:
           discord_webhook_url: ${{ secrets.DISCORD_WEBHOOK }}
-          discord_id_map_json: "{}"
+          discord_id_map_json: ${{ secrets.DISCORD_ID_MAP_JSON }}
+
