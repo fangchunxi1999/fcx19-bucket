@@ -1,0 +1,497 @@
+name: Discord PR Notifications
+
+on:
+  # PR lifecycle: opened, commit pushed (synchronize), closed/merged, reopened
+  pull_request:
+    types: [opened, synchronize, closed, reopened]
+  # Full review submitted: approve, request changes, or a review-level comment
+  pull_request_review:
+    types: [submitted]
+  # Inline comment left on a specific line or file in the diff
+  pull_request_review_comment:
+    types: [created]
+  # Comment posted in the PR conversation thread (not on a file)
+  # NOTE: this trigger always runs from the default branch, so it only works after this workflow is merged.
+  issue_comment:
+    types: [created]
+
+jobs:
+  notify-discord:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    # One queue per PR number so concurrent events serialize instead of racing to push to the thread-store branch.
+    concurrency:
+      group: discord-thread-pr-${{ github.event.pull_request.number || github.event.issue.number }}
+      cancel-in-progress: false
+    # Keep only PR-related issue_comment events; all other configured events are PR-only already.
+    if: github.event_name != 'issue_comment' || github.event.issue.pull_request != null
+    env:
+      THREAD_STORE_BRANCH: meta/discord-threads
+      THREAD_STORE_DIR: thread-store
+      THREAD_DATA_DIR: thread-store/.github/discord-threads
+      DISCORD_API_BASE: https://discord.com/api/v10
+      THREAD_ARCHIVE_DURATION: 1440
+      GIT_USER_EMAIL: action@github.com
+      GIT_USER_NAME: GitHub Action
+
+    steps:
+      # Checks out the PR merge commit. The checkout action also writes git credentials
+      # into the local git config so later `git push` calls work without a token in the URL.
+      # sparse-checkout limits the download to the workflows directory; none of the repo
+      # files (bucket/, bin/, etc.) are needed by this notification workflow.
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/workflows
+
+      # Writes a discord_curl() bash function to $RUNNER_TEMP, available to every subsequent step.
+      # Wraps curl with:
+      #   - automatic retry (up to 3×) on HTTP 429, honouring Discord's retry_after field
+      #   - a clear ::error:: annotation on HTTP 403 (bot lacks permission) before failing
+      #   - a clear ::error:: annotation on any other 4xx/5xx before failing
+      # Error annotations are written to stderr so they are not captured when the caller uses
+      # RESPONSE=$(discord_curl ...) — only the response body reaches the variable.
+      - name: Write Discord curl helper
+        run: |
+          cat > "$RUNNER_TEMP/discord_curl.sh" << 'SHELL_EOF'
+          discord_curl() {
+            local max_retries=3 attempt=0
+            local tmp_body
+            tmp_body=$(mktemp)
+            while [ $attempt -lt $max_retries ]; do
+              local http_status body
+              http_status=$(curl -s -o "$tmp_body" -w "%{http_code}" "$@")
+              body=$(cat "$tmp_body")
+              case "$http_status" in
+                200|201|204)
+                  echo "$body"; rm -f "$tmp_body"; return 0 ;;
+                429)
+                  attempt=$((attempt + 1))
+                  if [ $attempt -lt $max_retries ]; then
+                    local wait_secs
+                    wait_secs=$(echo "$body" | jq -r '.retry_after // 5' | awk '{printf "%d", $1 + 1}')
+                    echo "::warning::Discord rate limit (429). Waiting ${wait_secs}s (retry ${attempt}/${max_retries})..." >&2
+                    sleep "$wait_secs"
+                  else
+                    echo "::error::Discord rate limit (429) hit $max_retries times. Response: $body" >&2
+                    rm -f "$tmp_body"; return 1
+                  fi ;;
+                403)
+                  echo "::error::Discord returned 403 Forbidden — the bot likely lacks 'Send Messages' or 'Create Public Threads' permission in the channel. Response: $body" >&2
+                  rm -f "$tmp_body"; return 1 ;;
+                *)
+                  echo "::error::Discord API error (HTTP $http_status). Response: $body" >&2
+                  rm -f "$tmp_body"; return 1 ;;
+              esac
+            done
+            rm -f "$tmp_body"
+          }
+          SHELL_EOF
+
+      # Validate that both Discord secrets are present and accepted by Discord before doing any
+      # git or notification work. Fails fast with a clear error rather than a cryptic curl failure
+      # deep in a later step.
+      #   DISCORD_WEBHOOK  — verified by fetching webhook metadata (GET, no auth); expects a channel_id.
+      #   DISCORD_BOT_TOKEN — verified by calling GET /users/@me; expects an id field back.
+      - name: Validate Discord secrets
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+        run: |
+          # --- presence checks (secret not configured at all) ---
+          if [ -z "$DISCORD_WEBHOOK" ]; then
+            echo "::error::DISCORD_WEBHOOK secret is not set. Add it in Settings → Secrets."
+            exit 1
+          fi
+          if [ -z "$DISCORD_BOT_TOKEN" ]; then
+            echo "::error::DISCORD_BOT_TOKEN secret is not set. Add it in Settings → Secrets."
+            exit 1
+          fi
+
+          # --- validity check for DISCORD_WEBHOOK ---
+          WEBHOOK_META=$(curl -s "$DISCORD_WEBHOOK")
+          CHANNEL_ID=$(echo "$WEBHOOK_META" | jq -r '.channel_id')
+          if [ -z "$CHANNEL_ID" ] || [ "$CHANNEL_ID" = "null" ]; then
+            echo "::error::DISCORD_WEBHOOK is invalid or the webhook has been deleted. Response: $WEBHOOK_META"
+            exit 1
+          fi
+
+          # --- validity check for DISCORD_BOT_TOKEN ---
+          BOT_META=$(curl -s \
+            -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
+            "${{ env.DISCORD_API_BASE }}/users/@me")
+          BOT_ID=$(echo "$BOT_META" | jq -r '.id')
+          if [ -z "$BOT_ID" ] || [ "$BOT_ID" = "null" ]; then
+            echo "::error::DISCORD_BOT_TOKEN is invalid or the bot has been revoked. Response: $BOT_META"
+            exit 1
+          fi
+
+      # Mount the ${{ env.THREAD_STORE_BRANCH }} branch as a git worktree at ${{ env.THREAD_STORE_DIR }}.
+      # This branch is the sole storage location for Discord thread IDs — it never touches master or feature branches.
+      # If the branch does not yet exist on the remote, create it as an orphan (no history, no shared files).
+      # git config is set globally here so the orphan commit and all later commits use the correct identity.
+      - name: Setup discord-threads store
+        run: |
+          git config --global user.email "${{ env.GIT_USER_EMAIL }}"
+          git config --global user.name "${{ env.GIT_USER_NAME }}"
+
+          if git fetch --depth=1 origin ${{ env.THREAD_STORE_BRANCH }} 2>/dev/null; then
+            git worktree add ${{ env.THREAD_STORE_DIR }} ${{ env.THREAD_STORE_BRANCH }}
+            cd ${{ env.THREAD_STORE_DIR }}
+            # Ensure .github/discord-threads files are present for lookups in this run.
+            git sparse-checkout disable
+          else
+            git worktree add --orphan ${{ env.THREAD_STORE_DIR }} -b ${{ env.THREAD_STORE_BRANCH }}
+            cd ${{ env.THREAD_STORE_DIR }}
+            # Ensure .github/discord-threads files are present for lookups in this run.
+            git sparse-checkout disable
+            git commit --allow-empty -m "Initialize discord-threads storage branch"
+            if ! git push origin ${{ env.THREAD_STORE_BRANCH }}; then
+              # Another concurrent run likely created the branch first.
+              # Recover by switching this worktree to the now-existing remote branch.
+              cd ..
+              git worktree remove --force ${{ env.THREAD_STORE_DIR }}
+              git fetch --depth=1 origin ${{ env.THREAD_STORE_BRANCH }}
+              git worktree add ${{ env.THREAD_STORE_DIR }} ${{ env.THREAD_STORE_BRANCH }}
+              cd ${{ env.THREAD_STORE_DIR }}
+              git sparse-checkout disable
+            fi
+          fi
+
+      # Resolve PR metadata once for all event types.
+      # issue_comment does not include github.event.pull_request, so fetch it from API there.
+      - name: Resolve PR context
+        id: ctx
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_URL: ${{ github.event.issue.html_url }}
+          GH_PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_PR_TITLE: ${{ github.event.pull_request.title }}
+          GH_PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          GH_PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          GH_PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          if [ "$EVENT_NAME" = "issue_comment" ]; then
+            PR_NUMBER="$ISSUE_NUMBER"
+            PR_TITLE="$ISSUE_TITLE"
+            PR_URL="$ISSUE_URL"
+            PR_API=$(curl -s \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/pulls/${PR_NUMBER}")
+            PR_AUTHOR=$(echo "$PR_API" | jq -r '.user.login')
+            PR_HEAD_REF=$(echo "$PR_API" | jq -r '.head.ref')
+            PR_BASE_REF=$(echo "$PR_API" | jq -r '.base.ref')
+          else
+            PR_NUMBER="$GH_PR_NUMBER"
+            PR_TITLE="$GH_PR_TITLE"
+            PR_URL="$GH_PR_URL"
+            PR_AUTHOR="$GH_PR_AUTHOR"
+            PR_HEAD_REF="$GH_PR_HEAD_REF"
+            PR_BASE_REF="$GH_PR_BASE_REF"
+          fi
+
+          echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+          echo "pr_title=$PR_TITLE" >> $GITHUB_OUTPUT
+          echo "pr_url=$PR_URL" >> $GITHUB_OUTPUT
+          echo "pr_author=$PR_AUTHOR" >> $GITHUB_OUTPUT
+          echo "pr_head_ref=$PR_HEAD_REF" >> $GITHUB_OUTPUT
+          echo "pr_base_ref=$PR_BASE_REF" >> $GITHUB_OUTPUT
+
+      # pull_request_review(commented + empty body) is emitted together with
+      # pull_request_review_comment(created) for inline comments.
+      # Gate it once here so downstream if: expressions stay short.
+      - name: Evaluate event gate
+        id: event_gate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REVIEW_STATE: ${{ github.event.review.state }}
+          REVIEW_BODY: ${{ github.event.review.body }}
+          REVIEW_ID: ${{ github.event.review.id }}
+          PR_NUMBER: ${{ steps.ctx.outputs.pr_number }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          SKIP_EVENT=false
+          if [ "$EVENT_NAME" = "pull_request_review" ] && [ "$REVIEW_STATE" = "commented" ]; then
+            # Empty-body commented review is always a duplicate of inline comment events.
+            if [ -z "$REVIEW_BODY" ]; then
+              SKIP_EVENT=true
+            else
+              # When a commented review has inline comments, GitHub emits both
+              # pull_request_review and pull_request_review_comment events.
+              # Skip the review-level notification to avoid duplicate messages.
+              REVIEW_COMMENTS=$(curl -s \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${{ github.repository }}/pulls/${PR_NUMBER}/reviews/${REVIEW_ID}/comments")
+              COMMENTS_COUNT=$(echo "$REVIEW_COMMENTS" | jq -r 'length')
+              if [ "$COMMENTS_COUNT" -gt 0 ]; then
+                SKIP_EVENT=true
+              fi
+            fi
+          fi
+          echo "skip_event=$SKIP_EVENT" >> $GITHUB_OUTPUT
+
+      # Resolve whether we can reuse an existing thread.
+      # Outputs:
+      #   existing_thread_id  - thread ID from store file (if any)
+      #   thread_ready        - true when existing thread is confirmed alive
+      #   need_create_thread  - true when no reusable thread is available
+      - name: Resolve thread state
+        id: thread_state
+        env:
+          PR_NUMBER: ${{ steps.ctx.outputs.pr_number }}
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+        run: |
+          THREAD_ID_FILE="${{ env.THREAD_DATA_DIR }}/pr-${PR_NUMBER}.txt"
+          EXISTING_THREAD_ID=""
+          THREAD_READY=false
+          NEED_CREATE_THREAD=true
+
+          if [ -f "$THREAD_ID_FILE" ]; then
+            EXISTING_THREAD_ID=$(cat "$THREAD_ID_FILE")
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
+              "${{ env.DISCORD_API_BASE }}/channels/$EXISTING_THREAD_ID")
+            if [ "$HTTP_STATUS" = "200" ]; then
+              THREAD_READY=true
+              NEED_CREATE_THREAD=false
+            fi
+          fi
+
+          echo "existing_thread_id=$EXISTING_THREAD_ID" >> $GITHUB_OUTPUT
+          echo "thread_ready=$THREAD_READY" >> $GITHUB_OUTPUT
+          echo "need_create_thread=$NEED_CREATE_THREAD" >> $GITHUB_OUTPUT
+
+      # Post the initial "New Pull Request" embed to the Discord channel.
+      # Runs on any event if no usable thread exists yet (first event ever, or thread was deleted).
+      # The message ID returned by Discord is needed in the next step to attach a thread to it.
+      - name: Send New PR Notification
+        # if: no reusable live thread exists for this PR
+        if: steps.event_gate.outputs.skip_event != 'true' && steps.thread_state.outputs.need_create_thread == 'true'
+        id: new_pr
+        env:
+          PR_TITLE: ${{ steps.ctx.outputs.pr_title }}
+          PR_URL: ${{ steps.ctx.outputs.pr_url }}
+          PR_NUMBER: ${{ steps.ctx.outputs.pr_number }}
+          PR_AUTHOR: ${{ steps.ctx.outputs.pr_author }}
+          PR_HEAD_REF: ${{ steps.ctx.outputs.pr_head_ref }}
+          PR_BASE_REF: ${{ steps.ctx.outputs.pr_base_ref }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          source "$RUNNER_TEMP/discord_curl.sh"
+
+          # Build JSON payload with jq to safely handle any characters in user-controlled fields.
+          PAYLOAD=$(jq -n \
+            --arg title "$PR_TITLE" \
+            --arg author "$PR_AUTHOR" \
+            --arg head "$PR_HEAD_REF" \
+            --arg base "$PR_BASE_REF" \
+            --arg url "$PR_URL" \
+            --arg footer "${{ github.repository }} · PR #${PR_NUMBER}" \
+            --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)" \
+            '{
+              embeds: [{
+                title: "📬 New Pull Request",
+                description: "**\($title)**\n\n👤 **Author:** \($author)\n🌿 **Branch:** `\($head)` → `\($base)`\n\n[\($footer)](\($url))",
+                url: $url,
+                color: 3066993,
+                timestamp: $timestamp
+              }]
+            }')
+
+          RESPONSE=$(discord_curl \
+            -H "Content-Type: application/json" \
+            -X POST \
+            -d "$PAYLOAD" \
+            "$DISCORD_WEBHOOK?wait=true")
+
+          MESSAGE_ID=$(echo "$RESPONSE" | jq -r '.id')
+          if [ -z "$MESSAGE_ID" ] || [ "$MESSAGE_ID" = "null" ]; then
+            echo "::error::Failed to get message ID from Discord. Response: $RESPONSE"
+            exit 1
+          fi
+          echo "message_id=$MESSAGE_ID" >> $GITHUB_OUTPUT
+
+      # Create a Discord thread attached to the embed posted in the previous step.
+      # Requires a Bot token because the webhook API does not expose thread creation.
+      # The resulting thread ID is written both to GITHUB_OUTPUT (for use in Send Update)
+      # and to a file on the meta/discord-threads branch (for future workflow runs).
+      - name: Create Thread for New PR
+        # if: previous step actually sent a message and got back an ID
+        if: steps.new_pr.outputs.message_id != ''
+        id: create_thread
+        env:
+          PR_NUMBER: ${{ steps.ctx.outputs.pr_number }}
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          source "$RUNNER_TEMP/discord_curl.sh"
+          # The channel ID is not in the webhook URL but is returned by the webhook metadata endpoint.
+          WEBHOOK_META=$(curl -s "$DISCORD_WEBHOOK")
+          CHANNEL_ID=$(echo "$WEBHOOK_META" | jq -r '.channel_id')
+          if [ -z "$CHANNEL_ID" ] || [ "$CHANNEL_ID" = "null" ]; then
+            echo "::error::Failed to get channel ID from Discord webhook metadata. Is DISCORD_WEBHOOK valid? Response: $WEBHOOK_META"
+            exit 1
+          fi
+
+          # Create a public thread parented to the notification message.
+          THREAD_PAYLOAD=$(jq -n \
+            --arg name "[${{ github.repository }}] PR #${PR_NUMBER} Discussion" \
+            --argjson duration ${{ env.THREAD_ARCHIVE_DURATION }} \
+            '{ name: $name, auto_archive_duration: $duration }')
+
+          THREAD_RESPONSE=$(discord_curl \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
+            -X POST \
+            -d "$THREAD_PAYLOAD" \
+            "${{ env.DISCORD_API_BASE }}/channels/$CHANNEL_ID/messages/${{ steps.new_pr.outputs.message_id }}/threads")
+
+          THREAD_ID=$(echo "$THREAD_RESPONSE" | jq -r '.id')
+          if [ -z "$THREAD_ID" ] || [ "$THREAD_ID" = "null" ]; then
+            echo "::error::Failed to get thread ID from Discord. Response: $THREAD_RESPONSE"
+            exit 1
+          fi
+
+          # Persist the thread ID to the discord-threads branch for future events on this PR
+          mkdir -p ${{ env.THREAD_DATA_DIR }}
+          echo "$THREAD_ID" > "${{ env.THREAD_DATA_DIR }}/pr-${PR_NUMBER}.txt"
+          echo "thread_id=$THREAD_ID" >> $GITHUB_OUTPUT
+
+      # Post an event-specific update message into the Discord thread.
+      # Skipped for 'opened' because the initial embed already covers that event.
+      # Requires either a pre-existing live thread (thread_state) or one just created (create_thread).
+      - name: Send Update to Thread
+        # if: not an 'opened' event, AND a thread is available (verified alive or freshly created)
+        if: steps.event_gate.outputs.skip_event != 'true' && github.event.action != 'opened' && (steps.thread_state.outputs.thread_ready == 'true' || steps.create_thread.outputs.thread_id != '')
+        env:
+          ACTOR: ${{ github.actor }}
+          REVIEW_USER: ${{ github.event.review.user.login }}
+          REVIEW_STATE: ${{ github.event.review.state }}
+          COMMENT_USER: ${{ github.event.comment.user.login }}
+          COMMENT_PATH: ${{ github.event.comment.path }}
+          PR_MERGED: ${{ github.event.pull_request.merged }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
+          PR_URL: ${{ steps.ctx.outputs.pr_url }}
+          PR_NUMBER: ${{ steps.ctx.outputs.pr_number }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          source "$RUNNER_TEMP/discord_curl.sh"
+          # A fresh thread ID (just created this run) takes priority over the one read from the store file.
+          THREAD_ID="${{ steps.create_thread.outputs.thread_id || steps.thread_state.outputs.existing_thread_id }}"
+
+          # Select message text and embed colour based on the event action.
+          # All user-controlled values come from env vars set above, never interpolated inline,
+          # which prevents script injection.
+          case "$EVENT_ACTION" in
+            "synchronize")
+              # New commits were pushed to the PR branch
+              MESSAGE="🔄 **PR Updated** by ${ACTOR}"$'\n'"New commits pushed to the PR"
+              COLOR=16776960
+              ;;
+            "closed")
+              # Distinguish between a merge and a plain close
+              if [ "$PR_MERGED" = "true" ]; then
+                MESSAGE="🟣 **PR Merged** by ${ACTOR}"
+                COLOR=9000933
+              else
+                MESSAGE="❌ **PR Closed** by ${ACTOR}"
+                COLOR=16711680
+              fi
+              ;;
+            "reopened")
+              MESSAGE="🔓 **PR Reopened** by ${ACTOR}"
+              COLOR=16776960
+              ;;
+            "submitted")
+              # Full review submitted — approve and changes_requested carry distinct meaning;
+              # a plain comment-type review is shown the same as an inline comment ("New Review")
+              case "$REVIEW_STATE" in
+                "approved")
+                  MESSAGE="✅ **Review Approved** by ${REVIEW_USER}"
+                  COLOR=65280
+                  ;;
+                "changes_requested")
+                  MESSAGE="🔧 **Changes Requested** by ${REVIEW_USER}"
+                  COLOR=16776960
+                  ;;
+                *)
+                  MESSAGE="📝 **New Review** by ${REVIEW_USER}"
+                  COLOR=3447003
+                  ;;
+              esac
+              ;;
+            "created")
+              # inline diff comment (pull_request_review_comment) or PR conversation comment (issue_comment)
+              if [ "$EVENT_NAME" == "pull_request_review_comment" ]; then
+                MESSAGE="📝 **New Review** by ${COMMENT_USER}"$'\n'"On \`${COMMENT_PATH}\`"
+              else
+                MESSAGE="💬 **New Comment** by ${COMMENT_USER}"
+              fi
+              COLOR=3447003
+              ;;
+            *)
+              MESSAGE="🔔 **PR Activity** by ${ACTOR}"
+              COLOR=3447003
+              ;;
+          esac
+
+          PAYLOAD=$(jq -n \
+            --arg description "$MESSAGE" \
+            --arg url "$PR_URL" \
+            --argjson color "$COLOR" \
+            --arg footer "${{ github.repository }} · PR #${PR_NUMBER}" \
+            --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)" \
+            '{
+              embeds: [{
+                description: "\($description)\n\n[\($footer)](\($url))",
+                url: $url,
+                color: $color,
+                timestamp: $timestamp
+              }]
+            }')
+
+          discord_curl \
+            -H "Content-Type: application/json" \
+            -X POST \
+            -d "$PAYLOAD" \
+            "$DISCORD_WEBHOOK?thread_id=$THREAD_ID"
+
+      # Persist the newly created thread ID to the meta/discord-threads branch
+      # so every future event on this PR can look it up without touching any working branch.
+      - name: Save Thread ID to discord-threads branch
+        # if: a new thread was created in this run
+        if: steps.create_thread.outputs.thread_id != ''
+        env:
+          PR_NUMBER: ${{ steps.ctx.outputs.pr_number }}
+        run: |
+          cd ${{ env.THREAD_STORE_DIR }}
+          # The main checkout uses sparse-checkout (.github/workflows only), which the worktree
+          # inherits. Disable it here so git add can stage files in .github/discord-threads/.
+          git sparse-checkout disable
+          git config user.email "${{ env.GIT_USER_EMAIL }}"
+          git config user.name "${{ env.GIT_USER_NAME }}"
+          git add ".github/discord-threads/pr-${PR_NUMBER}.txt"
+          # Only commit when there is actually something staged; skip silently if already up-to-date.
+          git diff --cached --quiet || git commit -m "Add Discord thread ID for PR #${PR_NUMBER}"
+          # The thread-store branch is shared by all PR notifications; concurrent jobs can race.
+          # Retry push after rebasing onto latest remote tip to keep writes reliable.
+          for attempt in 1 2 3; do
+            if git push origin ${{ env.THREAD_STORE_BRANCH }}; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::Failed to push to ${{ env.THREAD_STORE_BRANCH }} after 3 attempts due to concurrent updates."
+              exit 1
+            fi
+            echo "::warning::Push race on ${{ env.THREAD_STORE_BRANCH }} (attempt ${attempt}/3). Rebasing and retrying..."
+            git fetch origin ${{ env.THREAD_STORE_BRANCH }}
+            git rebase origin/${{ env.THREAD_STORE_BRANCH }}
+          done
