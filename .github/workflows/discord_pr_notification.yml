@@ -1,3 +1,43 @@
+# =============================================================================
+# Discord PR Notifications
+# =============================================================================
+# Sends Discord embeds for pull request activity. Each PR gets its own thread
+# posted in a configured channel; all follow-up events update that thread.
+#
+# TRIGGERS
+#   pull_request        opened · synchronize (new commits) · closed/merged · reopened
+#   pull_request_review review submitted (approved / changes_requested / comment)
+#   issue_comment       comment posted in a PR conversation thread
+#                       NOTE: issue_comment runs from the default branch only —
+#                       this workflow must be merged to master before it fires.
+#
+# MESSAGES
+#   📬 New Pull Request       first event on a PR (any type); posted to the channel
+#   🔄 PR Updated             new commits pushed
+#   🟣 PR Merged              PR closed with merge
+#   ❌ PR Closed              PR closed without merge
+#   🔓 PR Reopened            PR reopened
+#   ✅ Review Approved        review submitted as approved
+#   🔧 Changes Requested      review submitted as changes_requested
+#   📝 New Review             review submitted as a comment
+#   💬 New Comment            issue_comment created on the PR
+#
+# STEPS
+#   1. Checkout repository          sparse-checkout (.github/workflows only)
+#   2. Setup Discord client         write discord_curl() helper; validate secrets
+#   3. Setup discord-threads store  mount meta/discord-threads as a git worktree
+#   4. Resolve PR context           normalise PR metadata across event types
+#   5. Resolve thread state         check for an existing live Discord thread
+#   6. Post notification and        post embed → create thread → persist thread ID
+#      create thread                (skipped when a live thread already exists)
+#   7. Send Update to Thread        post event-specific embed to the thread
+#                                   (skipped for 'opened'; covered by step 6)
+#
+# REQUIRED SECRETS
+#   DISCORD_WEBHOOK     Webhook URL for the target channel (Settings → Integrations)
+#   DISCORD_BOT_TOKEN   Bot token with Send Messages + Create Public Threads permissions
+# =============================================================================
+
 name: Discord PR Notifications
 
 on:
@@ -82,7 +122,7 @@ jobs:
           }
           SHELL_EOF
 
-          # --- presence checks ---
+          # check presence
           if [ -z "$DISCORD_WEBHOOK" ]; then
             echo "::error::DISCORD_WEBHOOK secret is not set. Add it in Settings → Secrets."
             exit 1
@@ -92,7 +132,7 @@ jobs:
             exit 1
           fi
 
-          # --- validity check for DISCORD_WEBHOOK ---
+          # validate DISCORD_WEBHOOK
           WEBHOOK_META=$(curl -s "$DISCORD_WEBHOOK")
           CHANNEL_ID=$(echo "$WEBHOOK_META" | jq -r '.channel_id')
           if [ -z "$CHANNEL_ID" ] || [ "$CHANNEL_ID" = "null" ]; then
@@ -100,7 +140,7 @@ jobs:
             exit 1
           fi
 
-          # --- validity check for DISCORD_BOT_TOKEN ---
+          # validate DISCORD_BOT_TOKEN
           BOT_META=$(curl -s \
             -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
             "${{ env.DISCORD_API_BASE }}/users/@me")
@@ -120,17 +160,14 @@ jobs:
           if git fetch --depth=1 origin ${{ env.THREAD_STORE_BRANCH }} 2>/dev/null; then
             git worktree add ${{ env.THREAD_STORE_DIR }} ${{ env.THREAD_STORE_BRANCH }}
             cd ${{ env.THREAD_STORE_DIR }}
-            # Ensure .github/discord-threads files are present for lookups in this run.
-            git sparse-checkout disable
+            git sparse-checkout disable  # ensure all thread-store files are available
           else
             git worktree add --orphan ${{ env.THREAD_STORE_DIR }} -b ${{ env.THREAD_STORE_BRANCH }}
             cd ${{ env.THREAD_STORE_DIR }}
-            # Ensure .github/discord-threads files are present for lookups in this run.
-            git sparse-checkout disable
+            git sparse-checkout disable  # ensure all thread-store files are available
             git commit --allow-empty -m "Initialize discord-threads storage branch"
             if ! git push origin ${{ env.THREAD_STORE_BRANCH }}; then
-              # Another concurrent run likely created the branch first.
-              # Recover by switching this worktree to the now-existing remote branch.
+              # push failed — another run created the branch first; switch to it
               cd ..
               git worktree remove --force ${{ env.THREAD_STORE_DIR }}
               git fetch --depth=1 origin ${{ env.THREAD_STORE_BRANCH }}
@@ -228,7 +265,7 @@ jobs:
         run: |
           source "$RUNNER_TEMP/discord_curl.sh"
 
-          # --- 1. Post the embed to the channel ---
+          # 1. post embed
           PAYLOAD=$(jq -n \
             --arg title "$PR_TITLE" \
             --arg author "$PR_AUTHOR" \
@@ -259,7 +296,7 @@ jobs:
             exit 1
           fi
 
-          # --- 2. Create a thread on that message (requires bot token; webhooks can't do this) ---
+          # 2. create thread (webhook API can't do this; bot token required)
           WEBHOOK_META=$(curl -s "$DISCORD_WEBHOOK")
           CHANNEL_ID=$(echo "$WEBHOOK_META" | jq -r '.channel_id')
           if [ -z "$CHANNEL_ID" ] || [ "$CHANNEL_ID" = "null" ]; then
@@ -285,7 +322,7 @@ jobs:
             exit 1
           fi
 
-          # --- 3. Persist thread ID to the discord-threads branch ---
+          # 3. persist thread ID
           mkdir -p ${{ env.THREAD_DATA_DIR }}
           echo "$THREAD_ID" > "${{ env.THREAD_DATA_DIR }}/pr-${PR_NUMBER}.txt"
 
@@ -327,17 +364,13 @@ jobs:
         run: |
           source "$RUNNER_TEMP/discord_curl.sh"
 
-          # Select message text and embed colour based on the event action.
-          # All user-controlled values come from env vars set above, never interpolated inline,
-          # which prevents script injection.
+          # pick message and colour; user values come from env vars to prevent script injection
           case "$EVENT_ACTION" in
             "synchronize")
-              # New commits were pushed to the PR branch
               MESSAGE="🔄 **PR Updated** by ${ACTOR}"$'\n'"New commits pushed to the PR"
               COLOR=16776960
               ;;
             "closed")
-              # Distinguish between a merge and a plain close
               if [ "$PR_MERGED" = "true" ]; then
                 MESSAGE="🟣 **PR Merged** by ${ACTOR}"
                 COLOR=9000933
@@ -351,8 +384,7 @@ jobs:
               COLOR=16776960
               ;;
             "submitted")
-              # Full review submitted — approve and changes_requested carry distinct meaning;
-              # a plain comment-type review is shown as "New Review"
+              # approved / changes_requested / comment → distinct messages
               case "$REVIEW_STATE" in
                 "approved")
                   MESSAGE="✅ **Review Approved** by ${REVIEW_USER}"
@@ -369,7 +401,6 @@ jobs:
               esac
               ;;
             "created")
-              # PR conversation comment (issue_comment)
               MESSAGE="💬 **New Comment** by ${COMMENT_USER}"
               COLOR=3447003
               ;;
