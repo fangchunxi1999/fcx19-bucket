@@ -8,8 +8,8 @@ on:
   pull_request_review:
     types: [submitted]
   # Inline comment left on a specific line or file in the diff
-  pull_request_review_comment:
-    types: [created]
+  # pull_request_review_comment:
+  #   types: [created]
   # Comment posted in the PR conversation thread (not on a file)
   # NOTE: this trigger always runs from the default branch, so it only works after this workflow is merged.
   issue_comment:
