@@ -36,6 +36,21 @@
 # REQUIRED SECRETS
 #   DISCORD_WEBHOOK     Webhook URL for the target channel (Settings → Integrations)
 #   DISCORD_BOT_TOKEN   Bot token with Send Messages + Create Public Threads permissions
+#
+# BOT SETUP
+#   The bot must be invited to the server and granted permissions on the target channel.
+#   1. Go to Discord Developer Portal → your application → OAuth2 → URL Generator
+#   2. Scopes: bot
+#   3. Bot permissions: Send Messages, Create Public Threads, Send Messages in Threads
+#   4. Open the generated URL, select your server, and authorise
+#   5. In the target channel → Edit Channel → Permissions → add the bot role,
+#      enable: View Channel, Send Messages, Create Public Threads, Send Messages in Threads
+#
+# BRANCH PROTECTION NOTE
+#   This workflow appears in the PR Checks section but must NOT be added as a required
+#   status check — it is notification-only and should never block a merge.
+#   Verify: Settings → Branches → your protection rule → ensure "notify-discord" is
+#   not listed under "Require status checks to pass before merging".
 # =============================================================================
 
 name: Discord PR Notifications
