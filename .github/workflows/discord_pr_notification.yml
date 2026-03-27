@@ -167,90 +167,27 @@ jobs:
             fi
           fi
 
-      # Normalise PR metadata across event types.
-      # issue_comment exposes the PR under github.event.issue, while all other events use github.event.pull_request.
-      # User-controlled values (title, URL) are passed through env: variables instead of being interpolated
-      # directly into the shell script, which prevents script injection attacks.
-      - name: Get PR Info
-        id: pr_info
+      # Resolve PR metadata once for all event types.
+      # issue_comment does not include github.event.pull_request, so fetch it from API there.
+      - name: Resolve PR context
+        id: ctx
         env:
           EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
           ISSUE_TITLE: ${{ github.event.issue.title }}
           ISSUE_URL: ${{ github.event.issue.html_url }}
           GH_PR_NUMBER: ${{ github.event.pull_request.number }}
           GH_PR_TITLE: ${{ github.event.pull_request.title }}
           GH_PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          GH_PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          GH_PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
-          # issue_comment events expose the PR through github.event.issue rather
-          # than github.event.pull_request, so we branch on the event name here.
-          if [ "$EVENT_NAME" == "issue_comment" ]; then
-            echo "pr_number=$ISSUE_NUMBER" >> $GITHUB_OUTPUT
-            echo "pr_title=$ISSUE_TITLE" >> $GITHUB_OUTPUT
-            echo "pr_url=$ISSUE_URL" >> $GITHUB_OUTPUT
-          else
-            echo "pr_number=$GH_PR_NUMBER" >> $GITHUB_OUTPUT
-            echo "pr_title=$GH_PR_TITLE" >> $GITHUB_OUTPUT
-            echo "pr_url=$GH_PR_URL" >> $GITHUB_OUTPUT
-          fi
-
-      # Look up whether a Discord thread was previously created for this PR.
-      # Thread IDs are stored as individual .txt files on the meta/discord-threads branch.
-      - name: Check for existing thread
-        id: check_thread
-        run: |
-          THREAD_ID_FILE="${{ env.THREAD_DATA_DIR }}/pr-${{ steps.pr_info.outputs.pr_number }}.txt"
-          if [ -f "$THREAD_ID_FILE" ]; then
-            THREAD_ID=$(cat "$THREAD_ID_FILE")
-            echo "thread_id=$THREAD_ID" >> $GITHUB_OUTPUT
-            echo "has_thread=true" >> $GITHUB_OUTPUT
-          else
-            echo "has_thread=false" >> $GITHUB_OUTPUT
-          fi
-
-      # Confirm the stored thread ID still resolves to a live Discord channel.
-      # A thread can disappear if it was manually deleted or if the channel was purged.
-      # Skipped entirely when no thread ID is on file (has_thread == 'false').
-      - name: Verify thread exists on Discord
-        id: verify_thread
-        # if: only worth calling Discord when a thread ID was found in the store
-        if: steps.check_thread.outputs.has_thread == 'true'
-        run: |
-          THREAD_ID="${{ steps.check_thread.outputs.thread_id }}"
-          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-            -H "Authorization: Bot ${{ secrets.DISCORD_BOT_TOKEN }}" \
-            "${{ env.DISCORD_API_BASE }}/channels/$THREAD_ID")
-          if [ "$HTTP_STATUS" = "200" ]; then
-            echo "thread_alive=true" >> $GITHUB_OUTPUT
-          else
-            echo "thread_alive=false" >> $GITHUB_OUTPUT
-          fi
-
-      # Post the initial "New Pull Request" embed to the Discord channel.
-      # Runs on any event if no usable thread exists yet (first event ever, or thread was deleted).
-      # The message ID returned by Discord is needed in the next step to attach a thread to it.
-      - name: Send New PR Notification
-        # if: no stored thread, OR stored thread was found dead by Verify step
-        if: steps.check_thread.outputs.has_thread == 'false' || steps.verify_thread.outputs.thread_alive == 'false'
-        id: new_pr
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          PR_TITLE: ${{ steps.pr_info.outputs.pr_title }}
-          PR_URL: ${{ steps.pr_info.outputs.pr_url }}
-          PR_NUMBER: ${{ steps.pr_info.outputs.pr_number }}
-          # For pull_request events these are populated directly from the event payload.
-          # For issue_comment events github.event.pull_request is null, so they start empty
-          # and are filled below via the GitHub REST API using the built-in github.token.
-          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
-          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
-          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
-          GH_TOKEN: ${{ github.token }}
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-        run: |
-          source "$RUNNER_TEMP/discord_curl.sh"
-          # issue_comment exposes no pull_request object, so fetch the missing fields from
-          # the REST API using the built-in github.token (no extra secret required).
-          if [ "$EVENT_NAME" == "issue_comment" ]; then
+          if [ "$EVENT_NAME" = "issue_comment" ]; then
+            PR_NUMBER="$ISSUE_NUMBER"
+            PR_TITLE="$ISSUE_TITLE"
+            PR_URL="$ISSUE_URL"
             PR_API=$(curl -s \
               -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
@@ -258,7 +195,70 @@ jobs:
             PR_AUTHOR=$(echo "$PR_API" | jq -r '.user.login')
             PR_HEAD_REF=$(echo "$PR_API" | jq -r '.head.ref')
             PR_BASE_REF=$(echo "$PR_API" | jq -r '.base.ref')
+          else
+            PR_NUMBER="$GH_PR_NUMBER"
+            PR_TITLE="$GH_PR_TITLE"
+            PR_URL="$GH_PR_URL"
+            PR_AUTHOR="$GH_PR_AUTHOR"
+            PR_HEAD_REF="$GH_PR_HEAD_REF"
+            PR_BASE_REF="$GH_PR_BASE_REF"
           fi
+
+          echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+          echo "pr_title=$PR_TITLE" >> $GITHUB_OUTPUT
+          echo "pr_url=$PR_URL" >> $GITHUB_OUTPUT
+          echo "pr_author=$PR_AUTHOR" >> $GITHUB_OUTPUT
+          echo "pr_head_ref=$PR_HEAD_REF" >> $GITHUB_OUTPUT
+          echo "pr_base_ref=$PR_BASE_REF" >> $GITHUB_OUTPUT
+
+      # Resolve whether we can reuse an existing thread.
+      # Outputs:
+      #   existing_thread_id  - thread ID from store file (if any)
+      #   thread_ready        - true when existing thread is confirmed alive
+      #   need_create_thread  - true when no reusable thread is available
+      - name: Resolve thread state
+        id: thread_state
+        env:
+          PR_NUMBER: ${{ steps.ctx.outputs.pr_number }}
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+        run: |
+          THREAD_ID_FILE="${{ env.THREAD_DATA_DIR }}/pr-${PR_NUMBER}.txt"
+          EXISTING_THREAD_ID=""
+          THREAD_READY=false
+          NEED_CREATE_THREAD=true
+
+          if [ -f "$THREAD_ID_FILE" ]; then
+            EXISTING_THREAD_ID=$(cat "$THREAD_ID_FILE")
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
+              "${{ env.DISCORD_API_BASE }}/channels/$EXISTING_THREAD_ID")
+            if [ "$HTTP_STATUS" = "200" ]; then
+              THREAD_READY=true
+              NEED_CREATE_THREAD=false
+            fi
+          fi
+
+          echo "existing_thread_id=$EXISTING_THREAD_ID" >> $GITHUB_OUTPUT
+          echo "thread_ready=$THREAD_READY" >> $GITHUB_OUTPUT
+          echo "need_create_thread=$NEED_CREATE_THREAD" >> $GITHUB_OUTPUT
+
+      # Post the initial "New Pull Request" embed to the Discord channel.
+      # Runs on any event if no usable thread exists yet (first event ever, or thread was deleted).
+      # The message ID returned by Discord is needed in the next step to attach a thread to it.
+      - name: Send New PR Notification
+        # if: no reusable live thread exists for this PR
+        if: steps.thread_state.outputs.need_create_thread == 'true'
+        id: new_pr
+        env:
+          PR_TITLE: ${{ steps.ctx.outputs.pr_title }}
+          PR_URL: ${{ steps.ctx.outputs.pr_url }}
+          PR_NUMBER: ${{ steps.ctx.outputs.pr_number }}
+          PR_AUTHOR: ${{ steps.ctx.outputs.pr_author }}
+          PR_HEAD_REF: ${{ steps.ctx.outputs.pr_head_ref }}
+          PR_BASE_REF: ${{ steps.ctx.outputs.pr_base_ref }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          source "$RUNNER_TEMP/discord_curl.sh"
 
           # Build JSON payload with jq to safely handle any characters in user-controlled fields.
           PAYLOAD=$(jq -n \
@@ -301,7 +301,7 @@ jobs:
         if: steps.new_pr.outputs.message_id != ''
         id: create_thread
         env:
-          PR_NUMBER: ${{ steps.pr_info.outputs.pr_number }}
+          PR_NUMBER: ${{ steps.ctx.outputs.pr_number }}
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         run: |
@@ -340,10 +340,10 @@ jobs:
 
       # Post an event-specific update message into the Discord thread.
       # Skipped for 'opened' because the initial embed already covers that event.
-      # Requires either a pre-existing live thread (verify_thread) or one just created (create_thread).
+      # Requires either a pre-existing live thread (thread_state) or one just created (create_thread).
       - name: Send Update to Thread
         # if: not an 'opened' event, AND a thread is available (verified alive or freshly created)
-        if: github.event.action != 'opened' && (steps.verify_thread.outputs.thread_alive == 'true' || steps.create_thread.outputs.thread_id != '')
+        if: github.event.action != 'opened' && (steps.thread_state.outputs.thread_ready == 'true' || steps.create_thread.outputs.thread_id != '')
         env:
           ACTOR: ${{ github.actor }}
           REVIEW_USER: ${{ github.event.review.user.login }}
@@ -353,13 +353,13 @@ jobs:
           PR_MERGED: ${{ github.event.pull_request.merged }}
           EVENT_NAME: ${{ github.event_name }}
           EVENT_ACTION: ${{ github.event.action }}
-          PR_URL: ${{ steps.pr_info.outputs.pr_url }}
-          PR_NUMBER: ${{ steps.pr_info.outputs.pr_number }}
+          PR_URL: ${{ steps.ctx.outputs.pr_url }}
+          PR_NUMBER: ${{ steps.ctx.outputs.pr_number }}
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         run: |
           source "$RUNNER_TEMP/discord_curl.sh"
           # A fresh thread ID (just created this run) takes priority over the one read from the store file.
-          THREAD_ID="${{ steps.create_thread.outputs.thread_id || steps.check_thread.outputs.thread_id }}"
+          THREAD_ID="${{ steps.create_thread.outputs.thread_id || steps.thread_state.outputs.existing_thread_id }}"
 
           # Select message text and embed colour based on the event action.
           # All user-controlled values come from env vars set above, never interpolated inline,
@@ -444,7 +444,7 @@ jobs:
         # if: a new thread was created in this run
         if: steps.create_thread.outputs.thread_id != ''
         env:
-          PR_NUMBER: ${{ steps.pr_info.outputs.pr_number }}
+          PR_NUMBER: ${{ steps.ctx.outputs.pr_number }}
         run: |
           cd ${{ env.THREAD_STORE_DIR }}
           # The main checkout uses sparse-checkout (.github/workflows only), which the worktree
