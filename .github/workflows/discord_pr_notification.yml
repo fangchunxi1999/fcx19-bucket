@@ -24,7 +24,7 @@
 #
 # STEPS
 #   1. Checkout repository          sparse-checkout (.github/workflows only)
-#   2. Setup Discord client         write discord_curl() helper; validate secrets
+#   2. Setup Discord client         write discord_curl() helper; validate secrets; output channel_id
 #   3. Setup discord-threads store  mount meta/discord-threads as a git worktree
 #   4. Resolve PR context           normalise PR metadata across event types
 #   5. Resolve thread state         check for an existing live Discord thread
@@ -81,8 +81,9 @@ jobs:
           sparse-checkout: .github/workflows
 
       # Writes discord_curl() to $RUNNER_TEMP (retries on 429, clear errors on 403/5xx),
-      # then validates DISCORD_WEBHOOK (expects channel_id) and DISCORD_BOT_TOKEN (expects id).
+      # validates both secrets, and outputs channel_id for reuse in later steps.
       - name: Setup Discord client
+        id: discord_client
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
@@ -132,13 +133,14 @@ jobs:
             exit 1
           fi
 
-          # validate DISCORD_WEBHOOK
+          # validate DISCORD_WEBHOOK — also capture channel_id for later steps
           WEBHOOK_META=$(curl -s "$DISCORD_WEBHOOK")
           CHANNEL_ID=$(echo "$WEBHOOK_META" | jq -r '.channel_id')
           if [ -z "$CHANNEL_ID" ] || [ "$CHANNEL_ID" = "null" ]; then
             echo "::error::DISCORD_WEBHOOK is invalid or the webhook has been deleted. Response: $WEBHOOK_META"
             exit 1
           fi
+          echo "channel_id=$CHANNEL_ID" >> $GITHUB_OUTPUT
 
           # validate DISCORD_BOT_TOKEN
           BOT_META=$(curl -s \
@@ -150,32 +152,28 @@ jobs:
             exit 1
           fi
 
-      # Mounts meta/discord-threads as a git worktree — the sole store for Discord thread IDs.
-      # Creates it as an orphan branch if it doesn't exist yet; handles the concurrent-creation race.
+      # Ensures meta/discord-threads exists as a remote branch, then mounts it as a worktree.
+      # Creates it as an orphan if absent; push races are resolved by falling back to the remote.
       - name: Setup discord-threads store
         run: |
           git config --global user.email "${{ env.GIT_USER_EMAIL }}"
           git config --global user.name "${{ env.GIT_USER_NAME }}"
 
-          if git fetch --depth=1 origin ${{ env.THREAD_STORE_BRANCH }} 2>/dev/null; then
-            git worktree add ${{ env.THREAD_STORE_DIR }} ${{ env.THREAD_STORE_BRANCH }}
-            cd ${{ env.THREAD_STORE_DIR }}
-            git sparse-checkout disable  # ensure all thread-store files are available
-          else
-            git worktree add --orphan ${{ env.THREAD_STORE_DIR }} -b ${{ env.THREAD_STORE_BRANCH }}
-            cd ${{ env.THREAD_STORE_DIR }}
-            git sparse-checkout disable  # ensure all thread-store files are available
+          # create orphan branch on remote if it doesn't exist yet
+          if ! git fetch --depth=1 origin ${{ env.THREAD_STORE_BRANCH }} 2>/dev/null; then
+            git worktree add --orphan tmp-init -b ${{ env.THREAD_STORE_BRANCH }}
+            cd tmp-init
             git commit --allow-empty -m "Initialize discord-threads storage branch"
-            if ! git push origin ${{ env.THREAD_STORE_BRANCH }}; then
-              # push failed — another run created the branch first; switch to it
-              cd ..
-              git worktree remove --force ${{ env.THREAD_STORE_DIR }}
-              git fetch --depth=1 origin ${{ env.THREAD_STORE_BRANCH }}
-              git worktree add ${{ env.THREAD_STORE_DIR }} ${{ env.THREAD_STORE_BRANCH }}
-              cd ${{ env.THREAD_STORE_DIR }}
-              git sparse-checkout disable
-            fi
+            git push origin ${{ env.THREAD_STORE_BRANCH }} || true  # ignore if another run beat us
+            cd ..
+            git worktree remove --force tmp-init
+            git fetch --depth=1 origin ${{ env.THREAD_STORE_BRANCH }}
           fi
+
+          # mount the branch as a worktree (always one path)
+          git worktree add ${{ env.THREAD_STORE_DIR }} ${{ env.THREAD_STORE_BRANCH }}
+          cd ${{ env.THREAD_STORE_DIR }}
+          git sparse-checkout disable  # ensure all thread-store files are available
 
       # Normalises PR metadata (number, title, URL, author, branches) across all event types.
       # For issue_comment events (which lack PR fields), fetches the PR via the GitHub REST API.
@@ -297,12 +295,7 @@ jobs:
           fi
 
           # 2. create thread (webhook API can't do this; bot token required)
-          WEBHOOK_META=$(curl -s "$DISCORD_WEBHOOK")
-          CHANNEL_ID=$(echo "$WEBHOOK_META" | jq -r '.channel_id')
-          if [ -z "$CHANNEL_ID" ] || [ "$CHANNEL_ID" = "null" ]; then
-            echo "::error::Failed to get channel ID from Discord webhook metadata. Response: $WEBHOOK_META"
-            exit 1
-          fi
+          CHANNEL_ID="${{ steps.discord_client.outputs.channel_id }}"
 
           THREAD_PAYLOAD=$(jq -n \
             --arg name "[${{ github.repository }}] PR #${PR_NUMBER} Discussion" \
