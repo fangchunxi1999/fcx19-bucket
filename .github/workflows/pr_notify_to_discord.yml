@@ -53,6 +53,88 @@ jobs:
         with:
           sparse-checkout: .github/workflows
 
+      # Writes a discord_curl() bash function to $RUNNER_TEMP, available to every subsequent step.
+      # Wraps curl with:
+      #   - automatic retry (up to 3×) on HTTP 429, honouring Discord's retry_after field
+      #   - a clear ::error:: annotation on HTTP 403 (bot lacks permission) before failing
+      #   - a clear ::error:: annotation on any other 4xx/5xx before failing
+      # Error annotations are written to stderr so they are not captured when the caller uses
+      # RESPONSE=$(discord_curl ...) — only the response body reaches the variable.
+      - name: Write Discord curl helper
+        run: |
+          cat > "$RUNNER_TEMP/discord_curl.sh" << 'SHELL_EOF'
+          discord_curl() {
+            local max_retries=3 attempt=0
+            local tmp_body
+            tmp_body=$(mktemp)
+            while [ $attempt -lt $max_retries ]; do
+              local http_status body
+              http_status=$(curl -s -o "$tmp_body" -w "%{http_code}" "$@")
+              body=$(cat "$tmp_body")
+              case "$http_status" in
+                200|201|204)
+                  echo "$body"; rm -f "$tmp_body"; return 0 ;;
+                429)
+                  attempt=$((attempt + 1))
+                  if [ $attempt -lt $max_retries ]; then
+                    local wait_secs
+                    wait_secs=$(echo "$body" | jq -r '.retry_after // 5' | awk '{printf "%d", $1 + 1}')
+                    echo "::warning::Discord rate limit (429). Waiting ${wait_secs}s (retry ${attempt}/${max_retries})..." >&2
+                    sleep "$wait_secs"
+                  else
+                    echo "::error::Discord rate limit (429) hit $max_retries times. Response: $body" >&2
+                    rm -f "$tmp_body"; return 1
+                  fi ;;
+                403)
+                  echo "::error::Discord returned 403 Forbidden — the bot likely lacks 'Send Messages' or 'Create Public Threads' permission in the channel. Response: $body" >&2
+                  rm -f "$tmp_body"; return 1 ;;
+                *)
+                  echo "::error::Discord API error (HTTP $http_status). Response: $body" >&2
+                  rm -f "$tmp_body"; return 1 ;;
+              esac
+            done
+            rm -f "$tmp_body"
+          }
+          SHELL_EOF
+
+      # Validate that both Discord secrets are present and accepted by Discord before doing any
+      # git or notification work. Fails fast with a clear error rather than a cryptic curl failure
+      # deep in a later step.
+      #   DISCORD_WEBHOOK  — verified by fetching webhook metadata (GET, no auth); expects a channel_id.
+      #   DISCORD_BOT_TOKEN — verified by calling GET /users/@me; expects an id field back.
+      - name: Validate Discord secrets
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+        run: |
+          # --- presence checks (secret not configured at all) ---
+          if [ -z "$DISCORD_WEBHOOK" ]; then
+            echo "::error::DISCORD_WEBHOOK secret is not set. Add it in Settings → Secrets."
+            exit 1
+          fi
+          if [ -z "$DISCORD_BOT_TOKEN" ]; then
+            echo "::error::DISCORD_BOT_TOKEN secret is not set. Add it in Settings → Secrets."
+            exit 1
+          fi
+
+          # --- validity check for DISCORD_WEBHOOK ---
+          WEBHOOK_META=$(curl -s "$DISCORD_WEBHOOK")
+          CHANNEL_ID=$(echo "$WEBHOOK_META" | jq -r '.channel_id')
+          if [ -z "$CHANNEL_ID" ] || [ "$CHANNEL_ID" = "null" ]; then
+            echo "::error::DISCORD_WEBHOOK is invalid or the webhook has been deleted. Response: $WEBHOOK_META"
+            exit 1
+          fi
+
+          # --- validity check for DISCORD_BOT_TOKEN ---
+          BOT_META=$(curl -s \
+            -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
+            "${{ env.DISCORD_API_BASE }}/users/@me")
+          BOT_ID=$(echo "$BOT_META" | jq -r '.id')
+          if [ -z "$BOT_ID" ] || [ "$BOT_ID" = "null" ]; then
+            echo "::error::DISCORD_BOT_TOKEN is invalid or the bot has been revoked. Response: $BOT_META"
+            exit 1
+          fi
+
       # Mount the ${{ env.THREAD_STORE_BRANCH }} branch as a git worktree at ${{ env.THREAD_STORE_DIR }}.
       # This branch is the sole storage location for Discord thread IDs — it never touches master or feature branches.
       # If the branch does not yet exist on the remote, create it as an orphan (no history, no shared files).
@@ -62,8 +144,6 @@ jobs:
           git config --global user.email "${{ env.GIT_USER_EMAIL }}"
           git config --global user.name "${{ env.GIT_USER_NAME }}"
 
-          # A single `git fetch --depth=1` both probes for the branch and retrieves it,
-          # replacing the previous two-call ls-remote + fetch pattern.
           if git fetch --depth=1 origin ${{ env.THREAD_STORE_BRANCH }} 2>/dev/null; then
             git worktree add ${{ env.THREAD_STORE_DIR }} ${{ env.THREAD_STORE_BRANCH }}
           else
@@ -139,14 +219,32 @@ jobs:
         if: steps.check_thread.outputs.has_thread == 'false' || steps.verify_thread.outputs.thread_alive == 'false'
         id: new_pr
         env:
+          EVENT_NAME: ${{ github.event_name }}
           PR_TITLE: ${{ steps.pr_info.outputs.pr_title }}
           PR_URL: ${{ steps.pr_info.outputs.pr_url }}
           PR_NUMBER: ${{ steps.pr_info.outputs.pr_number }}
+          # For pull_request events these are populated directly from the event payload.
+          # For issue_comment events github.event.pull_request is null, so they start empty
+          # and are filled below via the GitHub REST API using the built-in github.token.
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
           PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          GH_TOKEN: ${{ github.token }}
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         run: |
+          source "$RUNNER_TEMP/discord_curl.sh"
+          # issue_comment exposes no pull_request object, so fetch the missing fields from
+          # the REST API using the built-in github.token (no extra secret required).
+          if [ "$EVENT_NAME" == "issue_comment" ]; then
+            PR_API=$(curl -s \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/pulls/${PR_NUMBER}")
+            PR_AUTHOR=$(echo "$PR_API" | jq -r '.user.login')
+            PR_HEAD_REF=$(echo "$PR_API" | jq -r '.head.ref')
+            PR_BASE_REF=$(echo "$PR_API" | jq -r '.base.ref')
+          fi
+
           # Build JSON payload with jq to safely handle any characters in user-controlled fields.
           PAYLOAD=$(jq -n \
             --arg title "$PR_TITLE" \
@@ -166,13 +264,17 @@ jobs:
               }]
             }')
 
-          RESPONSE=$(curl -s --fail-with-body \
+          RESPONSE=$(discord_curl \
             -H "Content-Type: application/json" \
             -X POST \
             -d "$PAYLOAD" \
             "$DISCORD_WEBHOOK?wait=true")
 
           MESSAGE_ID=$(echo "$RESPONSE" | jq -r '.id')
+          if [ -z "$MESSAGE_ID" ] || [ "$MESSAGE_ID" = "null" ]; then
+            echo "::error::Failed to get message ID from Discord. Response: $RESPONSE"
+            exit 1
+          fi
           echo "message_id=$MESSAGE_ID" >> $GITHUB_OUTPUT
 
       # Create a Discord thread attached to the embed posted in the previous step.
@@ -188,8 +290,14 @@ jobs:
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         run: |
+          source "$RUNNER_TEMP/discord_curl.sh"
           # The channel ID is not in the webhook URL but is returned by the webhook metadata endpoint.
-          CHANNEL_ID=$(curl -s "$DISCORD_WEBHOOK" | jq -r '.channel_id')
+          WEBHOOK_META=$(curl -s "$DISCORD_WEBHOOK")
+          CHANNEL_ID=$(echo "$WEBHOOK_META" | jq -r '.channel_id')
+          if [ -z "$CHANNEL_ID" ] || [ "$CHANNEL_ID" = "null" ]; then
+            echo "::error::Failed to get channel ID from Discord webhook metadata. Is DISCORD_WEBHOOK valid? Response: $WEBHOOK_META"
+            exit 1
+          fi
 
           # Create a public thread parented to the notification message.
           THREAD_PAYLOAD=$(jq -n \
@@ -197,7 +305,7 @@ jobs:
             --argjson duration ${{ env.THREAD_ARCHIVE_DURATION }} \
             '{ name: $name, auto_archive_duration: $duration }')
 
-          THREAD_RESPONSE=$(curl -s --fail-with-body \
+          THREAD_RESPONSE=$(discord_curl \
             -H "Content-Type: application/json" \
             -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
             -X POST \
@@ -205,6 +313,10 @@ jobs:
             "${{ env.DISCORD_API_BASE }}/channels/$CHANNEL_ID/messages/${{ steps.new_pr.outputs.message_id }}/threads")
 
           THREAD_ID=$(echo "$THREAD_RESPONSE" | jq -r '.id')
+          if [ -z "$THREAD_ID" ] || [ "$THREAD_ID" = "null" ]; then
+            echo "::error::Failed to get thread ID from Discord. Response: $THREAD_RESPONSE"
+            exit 1
+          fi
 
           # Persist the thread ID to the discord-threads branch for future events on this PR
           mkdir -p ${{ env.THREAD_DATA_DIR }}
@@ -230,6 +342,7 @@ jobs:
           PR_NUMBER: ${{ steps.pr_info.outputs.pr_number }}
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         run: |
+          source "$RUNNER_TEMP/discord_curl.sh"
           # A fresh thread ID (just created this run) takes priority over the one read from the store file.
           THREAD_ID="${{ steps.create_thread.outputs.thread_id || steps.check_thread.outputs.thread_id }}"
 
@@ -304,7 +417,7 @@ jobs:
               }]
             }')
 
-          curl -s --fail-with-body \
+          discord_curl \
             -H "Content-Type: application/json" \
             -X POST \
             -d "$PAYLOAD" \
@@ -325,5 +438,6 @@ jobs:
           git config user.email "${{ env.GIT_USER_EMAIL }}"
           git config user.name "${{ env.GIT_USER_NAME }}"
           git add ".github/discord-threads/pr-${PR_NUMBER}.txt"
-          git commit -m "Add Discord thread ID for PR #${PR_NUMBER}" || exit 0
+          # Only commit when there is actually something staged; skip silently if already up-to-date.
+          git diff --cached --quiet || git commit -m "Add Discord thread ID for PR #${PR_NUMBER}"
           git push origin ${{ env.THREAD_STORE_BRANCH }}
