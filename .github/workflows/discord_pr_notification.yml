@@ -24,16 +24,8 @@ jobs:
     concurrency:
       group: discord-thread-pr-${{ github.event.pull_request.number || github.event.issue.number }}
       cancel-in-progress: false
-    # Run only when the event is actually related to a PR:
-    #   - pull_request / pull_request_review / pull_request_review_comment always have github.event.pull_request set.
-    #   - issue_comment fires for both issues and PRs; github.event.issue.pull_request is only present for PRs.
-    # Additionally, skip pull_request_review when state == 'commented' AND body is empty:
-    # GitHub fires pull_request_review (state: commented, empty body) together with pull_request_review_comment
-    # for every inline comment submission, which would send two notifications for the same event.
-    # When the review body is non-empty the user submitted an actual review comment, so we keep it.
-    if: |
-      (github.event.pull_request != null || (github.event.issue.pull_request != null && github.event_name == 'issue_comment')) &&
-      !(github.event_name == 'pull_request_review' && github.event.review.state == 'commented' && github.event.review.body == '')
+    # Keep only PR-related issue_comment events; all other configured events are PR-only already.
+    if: github.event_name != 'issue_comment' || github.event.issue.pull_request != null
     env:
       THREAD_STORE_BRANCH: meta/discord-threads
       THREAD_STORE_DIR: thread-store
@@ -211,6 +203,40 @@ jobs:
           echo "pr_head_ref=$PR_HEAD_REF" >> $GITHUB_OUTPUT
           echo "pr_base_ref=$PR_BASE_REF" >> $GITHUB_OUTPUT
 
+      # pull_request_review(commented + empty body) is emitted together with
+      # pull_request_review_comment(created) for inline comments.
+      # Gate it once here so downstream if: expressions stay short.
+      - name: Evaluate event gate
+        id: event_gate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REVIEW_STATE: ${{ github.event.review.state }}
+          REVIEW_BODY: ${{ github.event.review.body }}
+          REVIEW_ID: ${{ github.event.review.id }}
+          PR_NUMBER: ${{ steps.ctx.outputs.pr_number }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          SKIP_EVENT=false
+          if [ "$EVENT_NAME" = "pull_request_review" ] && [ "$REVIEW_STATE" = "commented" ]; then
+            # Empty-body commented review is always a duplicate of inline comment events.
+            if [ -z "$REVIEW_BODY" ]; then
+              SKIP_EVENT=true
+            else
+              # When a commented review has inline comments, GitHub emits both
+              # pull_request_review and pull_request_review_comment events.
+              # Skip the review-level notification to avoid duplicate messages.
+              REVIEW_COMMENTS=$(curl -s \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${{ github.repository }}/pulls/${PR_NUMBER}/reviews/${REVIEW_ID}/comments")
+              COMMENTS_COUNT=$(echo "$REVIEW_COMMENTS" | jq -r 'length')
+              if [ "$COMMENTS_COUNT" -gt 0 ]; then
+                SKIP_EVENT=true
+              fi
+            fi
+          fi
+          echo "skip_event=$SKIP_EVENT" >> $GITHUB_OUTPUT
+
       # Resolve whether we can reuse an existing thread.
       # Outputs:
       #   existing_thread_id  - thread ID from store file (if any)
@@ -247,7 +273,7 @@ jobs:
       # The message ID returned by Discord is needed in the next step to attach a thread to it.
       - name: Send New PR Notification
         # if: no reusable live thread exists for this PR
-        if: steps.thread_state.outputs.need_create_thread == 'true'
+        if: steps.event_gate.outputs.skip_event != 'true' && steps.thread_state.outputs.need_create_thread == 'true'
         id: new_pr
         env:
           PR_TITLE: ${{ steps.ctx.outputs.pr_title }}
@@ -343,7 +369,7 @@ jobs:
       # Requires either a pre-existing live thread (thread_state) or one just created (create_thread).
       - name: Send Update to Thread
         # if: not an 'opened' event, AND a thread is available (verified alive or freshly created)
-        if: github.event.action != 'opened' && (steps.thread_state.outputs.thread_ready == 'true' || steps.create_thread.outputs.thread_id != '')
+        if: steps.event_gate.outputs.skip_event != 'true' && github.event.action != 'opened' && (steps.thread_state.outputs.thread_ready == 'true' || steps.create_thread.outputs.thread_id != '')
         env:
           ACTOR: ${{ github.actor }}
           REVIEW_USER: ${{ github.event.review.user.login }}
