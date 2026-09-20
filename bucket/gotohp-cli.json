@@ -7,7 +7,7 @@
     "notes": "Open https://github.com/xob0t/gotohp#sign-in for sign-in instructions.",
     "architecture": {
         "64bit": {
-            "url": "https://github.com/xob0t/gotohp/releases/download/v0.11.0/gotohp-cli-x64.exe#c272a285a03aeea02a909f0b74d36f84c4a29c235c8dee47f7de75c83f15d2b1",
+            "url": "https://github.com/xob0t/gotohp/releases/download/v0.11.0/gotohp-cli-x64.exe",
             "hash": "c272a285a03aeea02a909f0b74d36f84c4a29c235c8dee47f7de75c83f15d2b1",
             "bin": "gotohp-cli-x64.exe"
         }
